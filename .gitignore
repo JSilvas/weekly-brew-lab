@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+
+# JavaScript dependencies
+*.egg-info/
+node_modules/
+

@@ -1,0 +1,819 @@
+"""
+Personal DJ — Gradio app.
+
+Tab 1: Collider-style prompt node canvas → Magenta RT2 → sounddevice audio.
+Tab 2: Screenshot context capture → LLM focus suffix → biases the canvas mix.
+
+Run:  uv run python app.py  →  http://localhost:7860
+macOS: grant Screen Recording and Accessibility permissions to the terminal.
+"""
+
+from __future__ import annotations
+
+import atexit
+import json
+import signal
+import threading
+import time
+from datetime import datetime
+
+import gradio as gr
+
+from engine import DJEngine
+from context import capture_screen, get_window_title, get_lm_client, evolve_focus
+
+# ── Shared state ──────────────────────────────────────────────────────────────
+
+engine       = DJEngine()
+
+def _shutdown():
+    """Stop audio and generation cleanly on any exit path."""
+    engine.pause()
+
+atexit.register(_shutdown)
+signal.signal(signal.SIGTERM, lambda *_: (_shutdown(), exit(0)))
+_ctx_running = False
+_ctx_lock    = threading.Lock()
+_focus_suffix     = ""
+_focus_history: list[str] = []
+_capture_log: list[str]   = []
+
+LOG_MAX = 40
+
+def _ts() -> str:
+    return datetime.now().strftime("%H:%M:%S")
+
+def _append_log(log: str, msg: str) -> str:
+    lines = log.splitlines()
+    lines.append(f"[{_ts()}] {msg}")
+    return "\n".join(lines[-LOG_MAX:])
+
+# ── Canvas HTML ───────────────────────────────────────────────────────────────
+# Ported from dev/magenta-realtime/examples/collider/
+# Physics: throw-on-release, wall bounce, exponential speed curve (turtle→rabbit).
+# Weight calc: inverse distance squared (FALLOFF=2), matching collider exactly.
+# Bridge: throttled JSON → hidden Gradio textbox → Python .input() handler.
+
+# Gradio 6: <script> tags in gr.HTML don't execute (injected via innerHTML).
+# Solution: HTML structure goes in gr.HTML; JS runs via demo.load(fn=None, js=...).
+
+CANVAS_HTML = """
+<div id="pdj-wrap" style="
+  position:relative;width:100%;height:480px;
+  background:#09090f;border-radius:10px;overflow:hidden;
+  cursor:default;user-select:none;">
+
+  <canvas id="pdj-canvas" style="position:absolute;inset:0;width:100%;height:100%;"></canvas>
+
+  <input id="pdj-edit" type="text" autocomplete="off" spellcheck="false"
+    placeholder="edit prompt…"
+    style="
+      position:absolute;display:none;z-index:20;
+      background:#1a1a2e;color:#eee;border:1px solid #555;border-radius:6px;
+      padding:4px 8px;font-size:13px;min-width:180px;outline:none;">
+
+  <!-- weight store: canvas JS writes here; Gradio timer js= reads it -->
+  <div id="pdj-data" style="display:none;"></div>
+
+  <div id="pdj-focus-pill" style="
+    position:absolute;top:10px;right:10px;z-index:10;
+    background:rgba(255,255,255,0.07);border-radius:20px;
+    padding:4px 12px;font-size:11px;color:#aaa;max-width:260px;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:none;">
+    🎯 <span id="pdj-focus-text"></span>
+  </div>
+
+  <div style="
+    position:absolute;bottom:0;left:0;right:0;height:44px;z-index:10;
+    background:rgba(9,9,15,0.85);display:flex;align-items:center;
+    padding:0 14px;gap:10px;">
+    <span style="font-size:16px;line-height:1;">🐢</span>
+    <input id="pdj-speed" type="range" min="0" max="1" step="0.005" value="0.35"
+      style="flex:1;accent-color:#48dbfb;">
+    <span style="font-size:16px;line-height:1;">🐇</span>
+    <button id="pdj-add" title="Add prompt (or double-click canvas)"
+      style="
+        background:rgba(255,255,255,0.1);border:none;color:#eee;
+        border-radius:6px;width:28px;height:28px;font-size:17px;
+        cursor:pointer;line-height:1;display:flex;align-items:center;justify-content:center;">
+      +
+    </button>
+  </div>
+</div>
+"""
+
+# JS injected via demo.load(fn=None, js=CANVAS_JS) after Gradio renders the DOM.
+CANVAS_JS = r"""
+(function () {
+
+// ── Suggestions (from collider's promptSuggestion.ts) ────────────────────────
+const ALL_SUGGESTIONS = [
+  "Dreamy Ambient Pads","Jazz Piano Trio","Electro Synthpop","Chiptune","Synthwave",
+  "Jazz Guitar","Saturated Gamelan Choir","Flamenco Nylon Guitar Rasgueado",
+  "Reggae Rhythm Guitar","Synthpop Groove Club Mix",
+  "Fast Swing Jazz Clarinet and Guitar","Afrobeat Band with Horns and Complex Drums",
+  "French House Disco Loops Filter Sweeps","Country Banjo Picking","R&B Smooth Keys",
+  "Soft Rock","Cyberpunk Synthwave Mariachi Horns","Trap Beat with Sampled Funk",
+  "UK Post-Dubstep String Quartet","African Kalimba","Lo-fi Hip Hop Beat",
+  "Smooth Bossa Nova","West African Kora Polyrhythms",
+  "Danceable Latin Jazz Salsa with Trombone","Celtic Fiddle Jig",
+  "Acoustic Folk Guitar","Church Organ","Surf Rock Guitar",
+  "Cavernous Endless Reverb Electric Guitar Swells","Japanese Koto",
+  "Gritty Garage Rock","Indian Classical Sitar and Tabla Raga",
+  "Middle Eastern Oud and Darbuka Groove","Ambient IDM Glitch Beats",
+  "Euphoric Washed-Out Noise Pop Fuzz","Andean Pan Flute Mountain Melody",
+  "Balinese Gamelan Metallic Percussion","Dark Cinematic Soundtrack",
+  "Brazilian Samba Batucada Percussion Ensemble",
+  "Heavily Digitally Distorted Harp Shimmer","Warm Vinyl Crackle Dusty Organ Chords",
+  "Supersaw Complextro Chords","Melodramatic Tremolo Mandolin",
+  "Trance Arpeggiated Synth","Baroque Cello Meets 90s Trance Euphoria",
+  "Polka Accordion","Dubstep Wobble Bass Synth","Medieval Rain",
+  "Granular Synthesis Frozen Vocal Textures","Slow Pad Sweeps Up",
+  "Cinematic Orchestral Hits","Violin Chamber Ensemble","Fanfare French Horn",
+  "Retro Synthwave Analog Lead","Ambient Pad Synthesizer",
+  "Bowed Vibraphone Sustained Metallic Ringing","Classical Cello",
+  "Delicate Vintage Music Box","Bluegrass Picked Banjo","Gentle Microtonal Flutes",
+  "Latin Mallet Marimba","Fingerpicked Acoustic Guitar","Chinese Guzheng",
+  "Orchestral Sustained Oboe","Nylon String Classical Guitar",
+];
+
+// Fisher-Yates shuffle
+const SHUFFLED = [...ALL_SUGGESTIONS];
+for (let i = SHUFFLED.length - 1; i > 0; i--) {
+  const j = Math.floor(Math.random() * (i + 1));
+  [SHUFFLED[i], SHUFFLED[j]] = [SHUFFLED[j], SHUFFLED[i]];
+}
+
+// ── Constants (matching collider) ─────────────────────────────────────────────
+const PROMPT_R   = 22;
+const LISTENER_R = 26;
+const FALLOFF    = 2.0;
+const MAX_NODES  = 6;
+const MIN_NODES  = 2;
+const MAX_SPEED  = 700;     // px/s ceiling
+const DAMPING    = 2.8;     // exponential decay rate per second
+const COLORS     = ['#ff6b6b','#48dbfb','#ffd32a','#0be881','#f8b500','#ff5e57'];
+const BRIDGE_HZ  = 10;
+
+// ── State ─────────────────────────────────────────────────────────────────────
+let W = 0, H = 0, PLAY_H = 0; // PLAY_H = H minus controls bar
+let nodes    = [];
+let listener = {x:0, y:0, vx:0, vy:0};
+let physicsSpeed = 0;      // 0..1 mapped exponentially to velocity multiplier
+let drag        = null;    // {type:'node'|'listener', id?, ox, oy}
+let selectedId  = null;
+let nextId      = 1;
+let nextColor   = 1;
+let deckIdx     = 1;
+let dashOffsets = [];
+let lastBridge  = 0;
+let animId      = null;
+let lastT       = null;
+let recentPos   = [];      // [{x,y,t}] for throw velocity
+
+// DOM refs — declared here so closures see them, assigned in initWhenReady
+let canvas, ctx, wrap, labelEdit;
+
+// ── Resize ────────────────────────────────────────────────────────────────────
+function resize() {
+  const r = wrap.getBoundingClientRect();
+  W = r.width  || 600;
+  H = r.height || 480;
+  canvas.width  = W;
+  canvas.height = H;
+  PLAY_H = H - 44; // subtract controls bar
+  clampAll();
+}
+
+function clampBall(b, R) {
+  b.x = Math.max(R, Math.min(W - R, b.x));
+  b.y = Math.max(R, Math.min(PLAY_H - R, b.y));
+}
+
+function clampAll() {
+  nodes.forEach(n => clampBall(n, PROMPT_R));
+  clampBall(listener, LISTENER_R);
+}
+
+// ── Initial layout — single centered node ─────────────────────────────────────
+function buildLayout() {
+  const cx = W / 2;
+  const cy = PLAY_H / 2;
+  nodes = [{
+    id: 0, colorIdx: 0,
+    x: cx, y: cy,
+    vx: 0, vy: 0,
+    label: SHUFFLED[0] || 'Dreamy Ambient Pads',
+  }];
+  listener    = {x: cx, y: cy - 160, vx: 0, vy: 0};
+  deckIdx     = 1;
+  dashOffsets = [0];
+}
+
+// ── Weight calculation (identical to collider's calculateWeights) ─────────────
+function calcWeights() {
+  if (!nodes.length) return [];
+  const dists = nodes.map(n => Math.hypot(n.x - listener.x, n.y - listener.y));
+  const zi = dists.findIndex(d => d < 1);
+  if (zi !== -1) return nodes.map((_, i) => i === zi ? 1 : 0);
+  const raw = dists.map(d => 1 / Math.pow(d, FALLOFF));
+  const sum = raw.reduce((a, b) => a + b, 0);
+  return raw.map(w => w / sum);
+}
+
+// ── Physics ───────────────────────────────────────────────────────────────────
+function advanceBall(b, dt) {
+  if (physicsSpeed < 0.001) return;
+  const damp = Math.exp(-DAMPING * dt);
+  b.vx *= damp;
+  b.vy *= damp;
+  const s = Math.hypot(b.vx, b.vy);
+  const cap = MAX_SPEED * physicsSpeed;
+  if (s > cap) { b.vx *= cap/s; b.vy *= cap/s; }
+  b.x += b.vx * dt;
+  b.y += b.vy * dt;
+}
+
+// ── Draw ──────────────────────────────────────────────────────────────────────
+function draw(weights) {
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = '#09090f';
+  ctx.fillRect(0, 0, W, H);
+
+  // Lines: listener → each node
+  nodes.forEach((n, i) => {
+    const w = weights[i] || 0;
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(listener.x, listener.y);
+    ctx.lineTo(n.x, n.y);
+    ctx.strokeStyle = `rgba(255,255,255,${(0.06 + 0.45 * w).toFixed(2)})`;
+    ctx.lineWidth   = 0.5 + 2.5 * w;
+    ctx.setLineDash([6, 6]);
+    ctx.lineDashOffset = -(dashOffsets[i] || 0);
+    ctx.stroke();
+    ctx.restore();
+  });
+
+  // Prompt nodes
+  nodes.forEach((n, i) => {
+    const color    = COLORS[n.colorIdx % COLORS.length];
+    const w        = weights[i] || 0;
+    const selected = n.id === selectedId;
+
+    ctx.save();
+    ctx.shadowBlur  = 6 + 22 * w;
+    ctx.shadowColor = color;
+    ctx.beginPath();
+    ctx.arc(n.x, n.y, PROMPT_R, 0, Math.PI*2);
+    ctx.fillStyle = color;
+    ctx.fill();
+    ctx.restore();
+
+    if (selected) {
+      ctx.beginPath();
+      ctx.arc(n.x, n.y, PROMPT_R + 5, 0, Math.PI*2);
+      ctx.strokeStyle = 'rgba(255,255,255,0.75)';
+      ctx.lineWidth   = 1.5;
+      ctx.stroke();
+    }
+
+    // Label (above node, word-wrapped at 130px)
+    ctx.fillStyle    = 'rgba(255,255,255,0.88)';
+    ctx.font         = '11px system-ui,sans-serif';
+    ctx.textAlign    = 'center';
+    ctx.textBaseline = 'bottom';
+    const words = n.label.split(' ');
+    const maxLW = 130;
+    let line = '', lines = [];
+    words.forEach(word => {
+      const test = line ? line + ' ' + word : word;
+      if (ctx.measureText(test).width > maxLW && line) { lines.push(line); line = word; }
+      else line = test;
+    });
+    if (line) lines.push(line);
+    lines.forEach((l, li) => {
+      ctx.fillText(l, n.x, n.y - PROMPT_R - 4 - (lines.length - 1 - li) * 13);
+    });
+  });
+
+  // Listener
+  ctx.save();
+  ctx.shadowBlur  = 18;
+  ctx.shadowColor = 'rgba(255,255,255,0.55)';
+  ctx.beginPath();
+  ctx.arc(listener.x, listener.y, LISTENER_R, 0, Math.PI*2);
+  ctx.fillStyle = 'rgba(255,255,255,0.90)';
+  ctx.fill();
+  ctx.restore();
+  ctx.beginPath();
+  ctx.arc(listener.x, listener.y, 4, 0, Math.PI*2);
+  ctx.fillStyle = '#09090f';
+  ctx.fill();
+}
+
+// ── Animation loop ────────────────────────────────────────────────────────────
+function loop(ts) {
+  animId = requestAnimationFrame(loop);
+  const dt = lastT ? Math.min((ts - lastT) / 1000, 0.05) : 0;
+  lastT = ts;
+
+  if (physicsSpeed > 0) {
+    if (!drag || drag.type !== 'listener') { advanceBall(listener, dt); clampBall(listener, LISTENER_R); }
+    nodes.forEach(n => {
+      if (!drag || drag.type !== 'node' || drag.id !== n.id) { advanceBall(n, dt); clampBall(n, PROMPT_R); }
+    });
+  }
+
+  const weights = calcWeights();
+  nodes.forEach((_, i) => { dashOffsets[i] = (dashOffsets[i] || 0) + (weights[i] || 0) * 55 * dt; });
+
+  draw(weights);
+
+  const now = performance.now();
+  if (now - lastBridge >= 1000 / BRIDGE_HZ) {
+    lastBridge = now;
+    pushBridge(weights);
+  }
+}
+
+// ── Bridge: write canvas state to plain div, read by Gradio timer js= ─────────
+// Gradio 6 Svelte doesn't fire .input() for programmatic textbox events, so we
+// write to a plain <div> and let the gr.Timer js= parameter read it each tick.
+function pushBridge(weights) {
+  const el = document.getElementById('pdj-data');
+  if (el) el.textContent = JSON.stringify({ weights, prompts: nodes.map(n => n.label) });
+}
+
+// ── Hit testing ───────────────────────────────────────────────────────────────
+function hitTest(mx, my) {
+  if (Math.hypot(mx - listener.x, my - listener.y) < LISTENER_R + 10)
+    return { type: 'listener' };
+  for (let i = nodes.length - 1; i >= 0; i--) {
+    if (Math.hypot(mx - nodes[i].x, my - nodes[i].y) < PROMPT_R + 10)
+      return { type: 'node', id: nodes[i].id };
+  }
+  return null;
+}
+
+function canvasXY(e) {
+  const r  = canvas.getBoundingClientRect();
+  const sx = W / r.width;
+  const sy = H / r.height;
+  return [(e.clientX - r.left) * sx, (e.clientY - r.top) * sy];
+}
+
+// ── Node add/edit (pure logic, no direct DOM — safe to define before init) ────
+function addNode(x, y) {
+  if (nodes.length >= MAX_NODES) return;
+  const label = SHUFFLED[deckIdx % SHUFFLED.length] || 'New Prompt';
+  deckIdx++;
+  nodes.push({ id: nextId++, colorIdx: nextColor++, x, y, vx: 0, vy: 0, label });
+  dashOffsets.push(0);
+}
+
+function startEdit(nodeId, clientX, clientY) {
+  const n = nodes.find(n => n.id === nodeId);
+  if (!n) return;
+  labelEdit.value          = n.label;
+  labelEdit.dataset.nodeId = String(nodeId);
+  const r = wrap.getBoundingClientRect();
+  labelEdit.style.left    = Math.max(4, clientX - r.left - 90) + 'px';
+  labelEdit.style.top     = Math.max(4, clientY - r.top  - 34) + 'px';
+  labelEdit.style.display = 'block';
+  labelEdit.focus();
+  labelEdit.select();
+}
+
+function commitEdit() {
+  const id = parseInt(labelEdit.dataset.nodeId);
+  const n  = nodes.find(n => n.id === id);
+  if (n && labelEdit.value.trim()) n.label = labelEdit.value.trim();
+  labelEdit.style.display = 'none';
+}
+
+// ── Expose focus update for Python → canvas ───────────────────────────────────
+window.pdjSetFocus = function(text) {
+  const pill = document.getElementById('pdj-focus-pill');
+  const span = document.getElementById('pdj-focus-text');
+  if (!span || !pill) return;
+  if (text) { span.textContent = text; pill.style.display = 'block'; }
+  else       { pill.style.display = 'none'; }
+};
+
+// ── Boot — poll for canvas; head= fires before Svelte renders the components ──
+// All DOM access (getElementById, addEventListener) happens here after elements exist.
+function initWhenReady() {
+  canvas = document.getElementById('pdj-canvas');
+  if (!canvas) { setTimeout(initWhenReady, 150); return; }
+
+  ctx      = canvas.getContext('2d');
+  wrap     = document.getElementById('pdj-wrap');
+  labelEdit = document.getElementById('pdj-edit');
+
+  // ── Mouse events ────────────────────────────────────────────────────────────
+  canvas.addEventListener('mousedown', e => {
+    if (labelEdit && labelEdit.style.display !== 'none') commitEdit();
+    const [mx, my] = canvasXY(e);
+    const hit = hitTest(mx, my);
+    if (hit) {
+      drag = { type: hit.type, id: hit.id };
+      selectedId = hit.type === 'node' ? hit.id : null;
+      recentPos  = [{ x: mx, y: my, t: Date.now() }];
+      e.preventDefault();
+    } else {
+      selectedId = null;
+    }
+  });
+
+  canvas.addEventListener('mousemove', e => {
+    if (!drag) return;
+    const [mx, my] = canvasXY(e);
+    if (drag.type === 'listener') {
+      listener.x = Math.max(LISTENER_R, Math.min(W - LISTENER_R, mx));
+      listener.y = Math.max(LISTENER_R, Math.min(PLAY_H - LISTENER_R, my));
+    } else {
+      const n = nodes.find(n => n.id === drag.id);
+      if (n) {
+        n.x = Math.max(PROMPT_R, Math.min(W - PROMPT_R, mx));
+        n.y = Math.max(PROMPT_R, Math.min(PLAY_H - PROMPT_R, my));
+      }
+    }
+    recentPos.push({ x: mx, y: my, t: Date.now() });
+    if (recentPos.length > 8) recentPos.shift();
+  });
+
+  canvas.addEventListener('mouseup', () => {
+    if (!drag) return;
+    if (physicsSpeed > 0 && recentPos.length >= 2) {
+      const a  = recentPos[Math.max(0, recentPos.length - 4)];
+      const b  = recentPos[recentPos.length - 1];
+      const dt = (b.t - a.t) / 1000;
+      if (dt > 0 && dt < 0.25) {
+        const vx = (b.x - a.x) / dt;
+        const vy = (b.y - a.y) / dt;
+        if (drag.type === 'listener') { listener.vx = vx; listener.vy = vy; }
+        else { const n = nodes.find(n => n.id === drag.id); if (n) { n.vx = vx; n.vy = vy; } }
+      }
+    }
+    drag = null;
+  });
+
+  canvas.addEventListener('mouseleave', () => { if (drag) drag = null; });
+
+  canvas.addEventListener('dblclick', e => {
+    const [mx, my] = canvasXY(e);
+    const hit = hitTest(mx, my);
+    if (hit?.type === 'node') startEdit(hit.id, e.clientX, e.clientY);
+    else if (!hit) addNode(mx, my);
+  });
+
+  canvas.addEventListener('contextmenu', e => {
+    e.preventDefault();
+    const [mx, my] = canvasXY(e);
+    const hit = hitTest(mx, my);
+    if (hit?.type === 'node' && nodes.length > MIN_NODES) {
+      const idx = nodes.findIndex(n => n.id === hit.id);
+      nodes.splice(idx, 1);
+      dashOffsets.splice(idx, 1);
+      if (selectedId === hit.id) selectedId = null;
+    }
+  });
+
+  // ── Label edit listeners ─────────────────────────────────────────────────────
+  labelEdit.addEventListener('keydown', e => {
+    if (e.key === 'Enter')  { commitEdit(); e.preventDefault(); }
+    if (e.key === 'Escape') { labelEdit.style.display = 'none'; }
+  });
+  labelEdit.addEventListener('blur', () => setTimeout(commitEdit, 80));
+
+  // ── Controls ─────────────────────────────────────────────────────────────────
+  const speedEl = document.getElementById('pdj-speed');
+  if (speedEl) speedEl.addEventListener('input', e => {
+    physicsSpeed = Math.pow(parseFloat(e.target.value), 2);
+  });
+
+  const addEl = document.getElementById('pdj-add');
+  if (addEl) addEl.addEventListener('click', () => {
+    const pad = 70;
+    addNode(pad + Math.random() * (W - 2*pad), pad + Math.random() * (PLAY_H - 2*pad));
+  });
+
+  // ── Start ─────────────────────────────────────────────────────────────────────
+  resize();
+  buildLayout();
+  const ro = new ResizeObserver(() => resize());
+  ro.observe(wrap);
+  animId = requestAnimationFrame(loop);
+}
+
+setTimeout(initWhenReady, 200);
+
+})(); // end IIFE
+"""
+
+
+# ── Gradio app ────────────────────────────────────────────────────────────────
+
+def handle_weights(bridge_json: str, alpha: float, transition_s: float):
+    """Called by the 2Hz style timer; bridge_json comes from the pdj-data div via js=."""
+    if not bridge_json or not engine.is_loaded:
+        return gr.skip()
+    try:
+        data    = json.loads(bridge_json)
+        prompts = data.get("prompts", [])
+        weights = data.get("weights", [])
+        if prompts and weights:
+            engine.set_style(prompts, weights, _focus_suffix, alpha, transition_s)
+    except Exception:
+        pass
+    return f"buffer {engine.buffer_s:.1f}s"
+
+
+def toggle_play(playing_state: bool, bridge_json: str, alpha: float, transition_s: float):
+    if playing_state:
+        engine.pause()
+        return False, gr.Button("▶ Play", variant="primary")
+    else:
+        if bridge_json:
+            try:
+                data    = json.loads(bridge_json)
+                prompts = data.get("prompts", [])
+                weights = data.get("weights", [])
+                if prompts and weights:
+                    engine.set_style(prompts, weights, _focus_suffix, alpha, 0)
+            except Exception:
+                pass
+        engine.play()
+        return True, gr.Button("⏸ Pause", variant="secondary")
+
+
+def get_ollama_models(ollama_url: str) -> list[str]:
+    """Query Ollama /api/tags for available model names."""
+    import httpx
+    base = (ollama_url or "http://localhost:11434/v1").rstrip("/").removesuffix("/v1")
+    try:
+        r = httpx.get(f"{base}/api/tags", timeout=3.0)
+        r.raise_for_status()
+        return [m["name"] for m in r.json().get("models", [])]
+    except Exception:
+        return []
+
+
+def load_model(model_size: str):
+    return engine.load(model_size)
+
+
+def context_tick(
+    lmstudio_url: str,
+    ollama_url: str,
+    model_name: str,
+    alpha: float,
+    transition_s: float,
+    bridge_json: str,
+    focus_state: str,
+    log: str,
+):
+    global _focus_suffix
+
+    if not _ctx_running:
+        return focus_state, log, gr.skip(), gr.skip(), gr.skip()
+
+    log = _append_log(log, "📸 Capturing screen…")
+
+    try:
+        b64, img = capture_screen()
+        title    = get_window_title()
+        log      = _append_log(log, f"🪟 {title}")
+
+        client, backend = get_lm_client(lmstudio_url, ollama_url)
+        if client is None:
+            log = _append_log(log, f"⚠️  {backend}")
+            return focus_state, log, img, backend, gr.skip()
+
+        prompts = []
+        if bridge_json:
+            try:
+                prompts = json.loads(bridge_json).get("prompts", [])
+            except Exception:
+                pass
+
+        log       = _append_log(log, f"🤖 {backend} — generating focus prompt…")
+        new_focus = evolve_focus(
+            client, model_name, prompts, focus_state, title, b64, alpha
+        )
+        _focus_suffix = new_focus
+        log = _append_log(log, f"🎵 → \"{new_focus}\"")
+
+        if prompts and bridge_json:
+            try:
+                data    = json.loads(bridge_json)
+                weights = data.get("weights", [])
+                engine.set_style(prompts, weights, new_focus, alpha, transition_s)
+            except Exception:
+                pass
+
+        return new_focus, log, img, f"✓ {backend}", new_focus
+
+    except Exception as e:
+        log = _append_log(log, f"✗ Error: {e}")
+        return focus_state, log, gr.skip(), gr.skip(), gr.skip()
+
+
+def toggle_context(running: bool):
+    global _ctx_running
+    _ctx_running = not running
+    return _ctx_running, ("⏸ Stop Capture" if _ctx_running else "▶ Start Capture")
+
+
+# ── Build UI ──────────────────────────────────────────────────────────────────
+
+with gr.Blocks(title="Personal DJ") as demo:
+
+    gr.Markdown("# 🎧 Personal DJ")
+
+    # Shared state
+    playing_state = gr.State(False)
+    ctx_running   = gr.State(False)
+    focus_state   = gr.State("")
+
+    with gr.Tabs():
+
+        # ── Tab 1: Music Studio ───────────────────────────────────────────────
+        with gr.Tab("🎵 Music Studio"):
+            with gr.Row():
+                # Canvas column
+                with gr.Column(scale=4):
+                    canvas_html = gr.HTML(CANVAS_HTML)
+                    focus_display = gr.Textbox(
+                        label="🎯 Focus flavor",
+                        interactive=False,
+                        placeholder="Context flavor will appear here once capture is running…",
+                    )
+                    # Hidden weight bridge
+                    bridge_tb = gr.Textbox(
+                        value="", visible=False, elem_id="dj_weight_bridge",
+                        label="bridge",
+                    )
+
+                # Controls column
+                with gr.Column(scale=1, min_width=200):
+                    model_dd    = gr.Dropdown(
+                        ["mrt2_small", "mrt2_base"],
+                        value="mrt2_small",
+                        label="Model",
+                    )
+                    load_btn    = gr.Button("Load Model", variant="secondary")
+                    load_status = gr.Textbox(
+                        value="Not loaded", label="Model status", interactive=False,
+                    )
+                    play_btn    = gr.Button("▶ Play", variant="primary")
+                    volume_sl   = gr.Slider(0, 1, value=0.7, step=0.05, label="Volume")
+                    alpha_sl    = gr.Slider(
+                        0, 1, value=0.3, step=0.05, label="Context Influence α",
+                        info="How strongly focus context biases the canvas mix",
+                    )
+                    transition_sl = gr.Slider(
+                        0, 60, value=20, step=1, label="Transition Duration (s)",
+                        info="Ramp time when focus suffix updates",
+                    )
+                    buffer_display = gr.Textbox(
+                        label="Engine", value="idle", interactive=False,
+                    )
+
+        # ── Tab 2: Context Capture ────────────────────────────────────────────
+        with gr.Tab("🔍 Context Capture"):
+            with gr.Row():
+                with gr.Column():
+                    gr.Markdown("### LLM Backend")
+                    gr.Markdown(
+                        "_LM Studio at `localhost:1234` is the default. "
+                        "If [LM Link](https://lmstudio.ai/docs/lmlink) is configured, "
+                        "requests are automatically routed to your remote device — no extra setup needed._",
+                        elem_classes=["gr-text-sm"],
+                    )
+                    lmstudio_tb  = gr.Textbox(
+                        label="LMStudio / LM Link",
+                        value="http://localhost:1234/v1",
+                    )
+                    ollama_tb    = gr.Textbox(
+                        label="Ollama local",
+                        value="http://localhost:11434/v1",
+                    )
+                    with gr.Row():
+                        model_dd_ctx = gr.Dropdown(
+                            label="Model",
+                            value="llama-3.2-vision-instruct",
+                            allow_custom_value=True,
+                            scale=3,
+                            info="Type any name or pick from Ollama ↓",
+                        )
+                        ollama_refresh_btn = gr.Button("🔄 Ollama", scale=1, min_width=90)
+                    # alias so context_tick can reference it as model_tb
+                    model_tb = model_dd_ctx
+                    cadence_sl   = gr.Slider(
+                        15, 120, value=30, step=5, label="Capture cadence (s)",
+                    )
+                    ctx_btn      = gr.Button("▶ Start Capture", variant="primary")
+
+                with gr.Column():
+                    ctx_status    = gr.Textbox(
+                        label="Active backend", value="—", interactive=False,
+                    )
+                    screen_img    = gr.Image(
+                        label="Last capture", interactive=False,
+                        height=200,
+                    )
+                    focus_hist    = gr.Textbox(
+                        label="Latest music flavor prompt",
+                        interactive=False,
+                        placeholder="(awaiting first capture)",
+                        lines=3,
+                    )
+                    capture_log   = gr.Textbox(
+                        label="Capture log", lines=10, max_lines=10,
+                        interactive=False, value="",
+                    )
+
+            capture_timer = gr.Timer(value=30, active=False)
+
+        # Style update timer — 2Hz, always active.
+        # Replaces bridge_tb.input() which doesn't reliably fire for programmatic
+        # DOM events in Gradio 6's Svelte runtime.
+        style_timer = gr.Timer(value=0.5, active=True)
+
+    # ── Event wiring ──────────────────────────────────────────────────────────
+
+    load_btn.click(
+        fn=load_model,
+        inputs=[model_dd],
+        outputs=[load_status],
+    )
+
+    play_btn.click(
+        fn=toggle_play,
+        js="(playing, _bj, alpha, trans) => { const d = document.getElementById('pdj-data'); return [playing, d ? d.textContent : '', alpha, trans]; }",
+        inputs=[playing_state, bridge_tb, alpha_sl, transition_sl],
+        outputs=[playing_state, play_btn],
+    )
+
+    volume_sl.change(
+        fn=lambda v: engine.set_volume(v),
+        inputs=[volume_sl],
+    )
+
+    # Style timer (2Hz): js= reads pdj-data div client-side, passes to Python.
+    # This bypasses the textbox bridge entirely — Gradio 6 Svelte doesn't update
+    # component state from programmatic DOM events on form elements.
+    style_timer.tick(
+        fn=handle_weights,
+        js="(_bj, alpha, trans) => { const d = document.getElementById('pdj-data'); return [d ? d.textContent : '', alpha, trans]; }",
+        inputs=[bridge_tb, alpha_sl, transition_sl],
+        outputs=[buffer_display],
+    )
+
+    # Context capture toggle
+    def _toggle_ctx(running, cadence):
+        new_run, label = toggle_context(running)
+        return new_run, label, gr.Timer(value=cadence, active=new_run)
+
+    ctx_btn.click(
+        fn=_toggle_ctx,
+        inputs=[ctx_running, cadence_sl],
+        outputs=[ctx_running, ctx_btn, capture_timer],
+    )
+
+    # Ollama model refresh
+    ollama_refresh_btn.click(
+        fn=lambda url: gr.Dropdown(choices=get_ollama_models(url)),
+        inputs=[ollama_tb],
+        outputs=[model_dd_ctx],
+    )
+
+    # Capture timer tick
+    capture_timer.tick(
+        fn=context_tick,
+        inputs=[
+            lmstudio_tb, ollama_tb, model_tb,
+            alpha_sl, transition_sl,
+            bridge_tb, focus_state, capture_log,
+        ],
+        outputs=[focus_state, capture_log, screen_img, ctx_status, focus_display],
+    )
+
+    # Mirror focus_state → Tab 2 history display
+    focus_state.change(
+        fn=lambda f: f,
+        inputs=[focus_state],
+        outputs=[focus_hist],
+    )
+
+    # Gradio 6: inject canvas JS via head= (executes on page load; IIFE polls for canvas element)
+    # demo.load(fn=None, js=...) stalls startup-events in Gradio 6, so we use head= instead.
+
+if __name__ == "__main__":
+    demo.launch(
+        server_name="0.0.0.0",
+        server_port=7861,
+        head=f"<script>{CANVAS_JS}</script>",
+    )
