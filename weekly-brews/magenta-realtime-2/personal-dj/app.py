@@ -24,7 +24,8 @@ from context import capture_screen, get_window_title, get_lm_client, evolve_focu
 
 # ── Shared state ──────────────────────────────────────────────────────────────
 
-engine       = DJEngine()
+engine           = DJEngine()
+DEFAULT_CTX_MODEL = "google/gemma-4-12b-qat"
 
 def _shutdown():
     """Stop audio and generation cleanly on any exit path."""
@@ -135,6 +136,7 @@ const ALL_SUGGESTIONS = [
   "Delicate Vintage Music Box","Bluegrass Picked Banjo","Gentle Microtonal Flutes",
   "Latin Mallet Marimba","Fingerpicked Acoustic Guitar","Chinese Guzheng",
   "Orchestral Sustained Oboe","Nylon String Classical Guitar",
+  "Deep Future Garage",
 ];
 
 // Fisher-Yates shuffle
@@ -149,7 +151,7 @@ const PROMPT_R   = 22;
 const LISTENER_R = 26;
 const FALLOFF    = 2.0;
 const MAX_NODES  = 6;
-const MIN_NODES  = 2;
+const MIN_NODES  = 1;
 const MAX_SPEED  = 700;     // px/s ceiling
 const DAMPING    = 2.8;     // exponential decay rate per second
 const COLORS     = ['#ff6b6b','#48dbfb','#ffd32a','#0be881','#f8b500','#ff5e57'];
@@ -161,6 +163,7 @@ let nodes    = [];
 let listener = {x:0, y:0, vx:0, vy:0};
 let physicsSpeed = 0;      // 0..1 mapped exponentially to velocity multiplier
 let drag        = null;    // {type:'node'|'listener', id?, ox, oy}
+let dragMX      = 0, dragMY = 0;  // raw mouse position during drag
 let selectedId  = null;
 let nextId      = 1;
 let nextColor   = 1;
@@ -235,10 +238,63 @@ function advanceBall(b, dt) {
 }
 
 // ── Draw ──────────────────────────────────────────────────────────────────────
+// ── Trash zone constants ──────────────────────────────────────────────────────
+const TRASH_CX = 44, TRASH_CY_FRAC = 0.5, TRASH_R = 28;
+function trashCY() { return PLAY_H * TRASH_CY_FRAC; }
+function overTrash(x, y) {
+  const dx = x - TRASH_CX, dy = y - trashCY();
+  return dx*dx + dy*dy <= TRASH_R*TRASH_R;
+}
+
+function drawTrash(alpha, hot) {
+  const cx = TRASH_CX, cy = trashCY();
+  ctx.save();
+  ctx.globalAlpha = alpha;
+
+  // Circle background
+  ctx.beginPath();
+  ctx.arc(cx, cy, TRASH_R, 0, Math.PI*2);
+  ctx.fillStyle = hot ? 'rgba(220,50,50,0.85)' : 'rgba(60,60,70,0.75)';
+  ctx.fill();
+  ctx.strokeStyle = hot ? 'rgba(255,100,100,0.9)' : 'rgba(180,180,190,0.4)';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  // Trash icon (lid + body + lines) scaled to fit
+  const s = 0.72;
+  ctx.translate(cx, cy);
+  ctx.scale(s, s);
+  ctx.strokeStyle = hot ? '#fff' : 'rgba(220,220,230,0.9)';
+  ctx.lineWidth = 1.8 / s;
+  ctx.lineCap = 'round';
+
+  // Lid
+  ctx.beginPath(); ctx.moveTo(-11, -9); ctx.lineTo(11, -9); ctx.stroke();
+  // Handle on lid
+  ctx.beginPath(); ctx.moveTo(-5, -9); ctx.lineTo(-5, -13); ctx.lineTo(5, -13); ctx.lineTo(5, -9); ctx.stroke();
+  // Body
+  ctx.beginPath();
+  ctx.moveTo(-9, -7); ctx.lineTo(-7, 12); ctx.lineTo(7, 12); ctx.lineTo(9, -7);
+  ctx.stroke();
+  // Inner lines
+  [-4, 0, 4].forEach(x => {
+    ctx.beginPath(); ctx.moveTo(x, -5); ctx.lineTo(x * 0.8, 10); ctx.stroke();
+  });
+
+  ctx.restore();
+}
+
 function draw(weights) {
   ctx.clearRect(0, 0, W, H);
   ctx.fillStyle = '#09090f';
   ctx.fillRect(0, 0, W, H);
+
+  // Trash zone — visible only while dragging a node
+  if (drag && drag.type === 'node') {
+    const n = nodes.find(n => n.id === drag.id);
+    const hot = n && overTrash(n.x, n.y);
+    drawTrash(hot ? 1.0 : 0.55, hot);
+  }
 
   // Lines: listener → each node
   nodes.forEach((n, i) => {
@@ -426,9 +482,10 @@ function initWhenReady() {
     }
   });
 
-  canvas.addEventListener('mousemove', e => {
+  window.addEventListener('mousemove', e => {
     if (!drag) return;
     const [mx, my] = canvasXY(e);
+    dragMX = mx; dragMY = my;
     if (drag.type === 'listener') {
       listener.x = Math.max(LISTENER_R, Math.min(W - LISTENER_R, mx));
       listener.y = Math.max(LISTENER_R, Math.min(PLAY_H - LISTENER_R, my));
@@ -443,8 +500,19 @@ function initWhenReady() {
     if (recentPos.length > 8) recentPos.shift();
   });
 
-  canvas.addEventListener('mouseup', () => {
+  window.addEventListener('mouseup', () => {
     if (!drag) return;
+
+    // Drop on trash zone — no minimum enforced, zero nodes = full context-driven mode
+    if (drag.type === 'node' && overTrash(dragMX, dragMY)) {
+      nodes = nodes.filter(nd => nd.id !== drag.id);
+      dashOffsets = nodes.map(() => 0);
+      if (selectedId === drag.id) selectedId = null;
+      drag = null;
+      return;
+    }
+
+    // Normal release — apply throw velocity
     if (physicsSpeed > 0 && recentPos.length >= 2) {
       const a  = recentPos[Math.max(0, recentPos.length - 4)];
       const b  = recentPos[recentPos.length - 1];
@@ -458,8 +526,6 @@ function initWhenReady() {
     }
     drag = null;
   });
-
-  canvas.addEventListener('mouseleave', () => { if (drag) drag = null; });
 
   canvas.addEventListener('dblclick', e => {
     const [mx, my] = canvasXY(e);
@@ -523,8 +589,8 @@ def handle_weights(bridge_json: str, alpha: float, transition_s: float):
         data    = json.loads(bridge_json)
         prompts = data.get("prompts", [])
         weights = data.get("weights", [])
-        if prompts and weights:
-            engine.set_style(prompts, weights, _focus_suffix, alpha, transition_s)
+        # Always call set_style — empty prompts means focus-only mode
+        engine.set_style(prompts, weights, _focus_suffix, alpha, transition_s)
     except Exception:
         pass
     return f"buffer {engine.buffer_s:.1f}s"
@@ -540,33 +606,118 @@ def toggle_play(playing_state: bool, bridge_json: str, alpha: float, transition_
                 data    = json.loads(bridge_json)
                 prompts = data.get("prompts", [])
                 weights = data.get("weights", [])
-                if prompts and weights:
-                    engine.set_style(prompts, weights, _focus_suffix, alpha, 0)
+                engine.set_style(prompts, weights, _focus_suffix, alpha, 0)
             except Exception:
                 pass
         engine.play()
         return True, gr.Button("⏸ Pause", variant="secondary")
 
 
-def get_ollama_models(ollama_url: str) -> list[str]:
-    """Query Ollama /api/tags for available model names."""
+def _lmstudio_base(lmstudio_url: str) -> str:
+    return (lmstudio_url or "http://localhost:1234/v1").rstrip("/").removesuffix("/v1")
+
+
+def get_lmstudio_models(lmstudio_url: str) -> list[str]:
+    """Return loaded models from LM Studio using the v1 REST API."""
     import httpx
-    base = (ollama_url or "http://localhost:11434/v1").rstrip("/").removesuffix("/v1")
+    base = _lmstudio_base(lmstudio_url)
+    # LM Studio 0.4+ native API
     try:
-        r = httpx.get(f"{base}/api/tags", timeout=3.0)
+        r = httpx.get(f"{base}/api/v1/models", timeout=3.0)
         r.raise_for_status()
-        return [m["name"] for m in r.json().get("models", [])]
+        data = r.json()
+        items = data if isinstance(data, list) else data.get("data", [])
+        if items:
+            return [m.get("id") or m.get("path", "") for m in items]
+    except Exception:
+        pass
+    # OpenAI-compat fallback
+    try:
+        r = httpx.get(f"{base}/v1/models", timeout=3.0)
+        r.raise_for_status()
+        return [m["id"] for m in r.json().get("data", [])]
     except Exception:
         return []
 
 
+def load_lmstudio_model(lmstudio_url: str, model_id: str) -> str:
+    """Ask LM Studio to load a model via the v1 REST API."""
+    import httpx
+    if not model_id:
+        return "No model selected"
+    base = _lmstudio_base(lmstudio_url)
+    try:
+        r = httpx.post(
+            f"{base}/api/v1/models/load",
+            json={"path": model_id},
+            timeout=60.0,
+        )
+        if r.status_code == 200:
+            return f"✓ {model_id} loaded"
+        return f"⚠ {r.status_code}: {r.text[:120]}"
+    except Exception as e:
+        return f"✗ {e}"
+
+
+def test_lm_connection(lmstudio_url: str, model_name: str, log: str) -> str:
+    """Fire a minimal test prompt and log the response to validate the connection."""
+    client, name = get_lm_client(lmstudio_url)
+    if client is None:
+        return _append_log(log, f"✗ {name}")
+
+    # Use the selected model, fall back to DEFAULT_CTX_MODEL
+    model = model_name or DEFAULT_CTX_MODEL
+    log = _append_log(log, f"🔌 Testing {name} ({model})…")
+
+    def _attempt():
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": "Reply with three words that describe ambient music."}],
+            max_tokens=500,
+            temperature=0.7,
+        )
+        choice = resp.choices[0]
+        content = (choice.message.content or "").strip()
+        if not content:
+            # Surface diagnostics so we can see what the model actually returned
+            nonlocal log
+            log = _append_log(log, f"  finish_reason={choice.finish_reason} usage={getattr(resp, 'usage', '?')}")
+        return content
+
+    try:
+        reply = _attempt()
+        if not reply:
+            # Model accepted request but returned empty — likely still loading
+            log = _append_log(log, "⏳ Model warming up, retrying in 3s…")
+            time.sleep(3)
+            reply = _attempt()
+        if reply:
+            return _append_log(log, f"✓ Connected — \"{reply}\"")
+        return _append_log(log, "⚠ Model connected but returned empty response")
+    except Exception as e:
+        err = str(e)
+        if "No models loaded" in err:
+            log = _append_log(log, f"⏳ No model loaded — triggering load of {model}…")
+            load_lmstudio_model(lmstudio_url, model)
+            log = _append_log(log, "Waiting 5s for model to load…")
+            time.sleep(5)
+            try:
+                reply = _attempt()
+                if reply:
+                    return _append_log(log, f"✓ Connected — \"{reply}\"")
+                return _append_log(log, "⚠ Model loaded but returned empty — may still be warming up")
+            except Exception as e2:
+                return _append_log(log, f"✗ {e2}")
+        return _append_log(log, f"✗ {err}")
+
+
 def load_model(model_size: str):
+    engine.pause()   # stop any running audio before (re)loading
     return engine.load(model_size)
 
 
 def context_tick(
     lmstudio_url: str,
-    ollama_url: str,
     model_name: str,
     alpha: float,
     transition_s: float,
@@ -586,7 +737,7 @@ def context_tick(
         title    = get_window_title()
         log      = _append_log(log, f"🪟 {title}")
 
-        client, backend = get_lm_client(lmstudio_url, ollama_url)
+        client, backend = get_lm_client(lmstudio_url)
         if client is None:
             log = _append_log(log, f"⚠️  {backend}")
             return focus_state, log, img, backend, gr.skip()
@@ -663,7 +814,6 @@ with gr.Blocks(title="Personal DJ") as demo:
                         value="mrt2_small",
                         label="Model",
                     )
-                    load_btn    = gr.Button("Load Model", variant="secondary")
                     load_status = gr.Textbox(
                         value="Not loaded", label="Model status", interactive=False,
                     )
@@ -683,58 +833,57 @@ with gr.Blocks(title="Personal DJ") as demo:
 
         # ── Tab 2: Context Capture ────────────────────────────────────────────
         with gr.Tab("🔍 Context Capture"):
-            with gr.Row():
-                with gr.Column():
-                    gr.Markdown("### LLM Backend")
-                    gr.Markdown(
-                        "_LM Studio at `localhost:1234` is the default. "
-                        "If [LM Link](https://lmstudio.ai/docs/lmlink) is configured, "
-                        "requests are automatically routed to your remote device — no extra setup needed._",
-                        elem_classes=["gr-text-sm"],
-                    )
-                    lmstudio_tb  = gr.Textbox(
-                        label="LMStudio / LM Link",
-                        value="http://localhost:1234/v1",
-                    )
-                    ollama_tb    = gr.Textbox(
-                        label="Ollama local",
-                        value="http://localhost:11434/v1",
-                    )
-                    with gr.Row():
-                        model_dd_ctx = gr.Dropdown(
-                            label="Model",
-                            value="llama-3.2-vision-instruct",
-                            allow_custom_value=True,
-                            scale=3,
-                            info="Type any name or pick from Ollama ↓",
-                        )
-                        ollama_refresh_btn = gr.Button("🔄 Ollama", scale=1, min_width=90)
-                    # alias so context_tick can reference it as model_tb
-                    model_tb = model_dd_ctx
-                    cadence_sl   = gr.Slider(
-                        15, 120, value=30, step=5, label="Capture cadence (s)",
-                    )
-                    ctx_btn      = gr.Button("▶ Start Capture", variant="primary")
 
-                with gr.Column():
-                    ctx_status    = gr.Textbox(
-                        label="Active backend", value="—", interactive=False,
+            # ── Configuration — full width, collapses on Start ────────────────
+            with gr.Accordion("⚙️ Configuration", open=True) as config_accordion:
+                gr.Markdown(
+                    "_[LM Link](https://lmstudio.ai/docs/lmlink) routes `localhost:1234` "
+                    "to your remote device automatically when configured._"
+                )
+                lmstudio_tb = gr.Textbox(
+                    label="LMStudio / LM Link",
+                    value="http://localhost:1234/v1",
+                )
+                with gr.Row():
+                    model_dd_ctx = gr.Dropdown(
+                        label="Model",
+                        value=None,
+                        allow_custom_value=True,
+                        scale=3,
+                        info="Use 🔄 to detect from LM Studio",
                     )
-                    screen_img    = gr.Image(
-                        label="Last capture", interactive=False,
-                        height=200,
+                    lmstudio_refresh_btn = gr.Button("🔄", scale=0, min_width=48)
+
+            ctx_btn      = gr.Button("▶ Start Capture", variant="primary")
+            ctx_stop_btn = gr.Button("⏸ Stop Capture", variant="secondary", visible=False)
+
+            # ── Two-column live section ───────────────────────────────────────
+            with gr.Row():
+
+                # Left — Context
+                with gr.Column(scale=1):
+                    capture_log = gr.Textbox(
+                        label="Activity Log", lines=12, max_lines=12,
+                        interactive=False, value="",
                     )
-                    focus_hist    = gr.Textbox(
-                        label="Latest music flavor prompt",
+                    focus_hist  = gr.Textbox(
+                        label="Music Flavor Prompt",
                         interactive=False,
                         placeholder="(awaiting first capture)",
                         lines=3,
                     )
-                    capture_log   = gr.Textbox(
-                        label="Capture log", lines=10, max_lines=10,
-                        interactive=False, value="",
+
+                # Right — Capture
+                with gr.Column(scale=1):
+                    cadence_sl = gr.Slider(
+                        5, 120, value=30, step=5, label="Capture Cadence (s)",
+                    )
+                    screen_img = gr.Image(
+                        label="Last Capture", interactive=False,
                     )
 
+            model_tb   = model_dd_ctx
+            ctx_status = gr.Textbox(visible=False)  # wiring only
             capture_timer = gr.Timer(value=30, active=False)
 
         # Style update timer — 2Hz, always active.
@@ -744,10 +893,35 @@ with gr.Blocks(title="Personal DJ") as demo:
 
     # ── Event wiring ──────────────────────────────────────────────────────────
 
-    load_btn.click(
+    model_dd.change(
         fn=load_model,
         inputs=[model_dd],
         outputs=[load_status],
+    )
+
+    def on_page_load(model_size: str, lmstudio_url: str):
+        """Stop audio, reload Magenta model, ping LM Studio to load the vision
+        model, and update the model dropdown if LM Studio has something loaded."""
+        status = load_model(model_size)
+
+        # Check what's actually loaded in LM Studio right now
+        loaded_models = get_lmstudio_models(lmstudio_url)
+        if loaded_models:
+            # LM Studio is up and has a model — show what's actually there
+            ctx_model = gr.Dropdown(choices=loaded_models, value=loaded_models[0])
+        else:
+            # Not reachable or nothing loaded — ping in background, keep default
+            def _ping():
+                load_lmstudio_model(lmstudio_url, DEFAULT_CTX_MODEL)
+            threading.Thread(target=_ping, daemon=True).start()
+            ctx_model = gr.skip()
+
+        return status, False, gr.Button("▶ Play", variant="primary"), ctx_model
+
+    demo.load(
+        fn=on_page_load,
+        inputs=[model_dd, lmstudio_tb],
+        outputs=[load_status, playing_state, play_btn, model_dd_ctx],
     )
 
     play_btn.click(
@@ -773,28 +947,66 @@ with gr.Blocks(title="Personal DJ") as demo:
     )
 
     # Context capture toggle
-    def _toggle_ctx(running, cadence):
-        new_run, label = toggle_context(running)
-        return new_run, label, gr.Timer(value=cadence, active=new_run)
+    def _start_ctx(running, cadence):
+        new_run, _ = toggle_context(running)
+        return (
+            new_run,
+            gr.Timer(value=cadence, active=new_run),
+            gr.Accordion(open=False),   # collapse config on start
+            gr.Button(visible=False),   # hide start btn
+            gr.Button(visible=True),    # show stop btn
+        )
+
+    def _stop_ctx(running, cadence):
+        new_run, _ = toggle_context(running)
+        return (
+            new_run,
+            gr.Timer(value=cadence, active=new_run),
+            gr.Accordion(open=True),    # re-expand config on stop
+            gr.Button(visible=True),    # show start btn
+            gr.Button(visible=False),   # hide stop btn
+        )
 
     ctx_btn.click(
-        fn=_toggle_ctx,
+        fn=_start_ctx,
         inputs=[ctx_running, cadence_sl],
-        outputs=[ctx_running, ctx_btn, capture_timer],
+        outputs=[ctx_running, capture_timer, config_accordion, ctx_btn, ctx_stop_btn],
+    ).then(
+        fn=context_tick,
+        inputs=[lmstudio_tb, model_tb, alpha_sl, transition_sl, bridge_tb, focus_state, capture_log],
+        outputs=[focus_state, capture_log, screen_img, ctx_status, focus_display],
+    )
+    ctx_stop_btn.click(
+        fn=_stop_ctx,
+        inputs=[ctx_running, cadence_sl],
+        outputs=[ctx_running, capture_timer, config_accordion, ctx_btn, ctx_stop_btn],
     )
 
-    # Ollama model refresh
-    ollama_refresh_btn.click(
-        fn=lambda url: gr.Dropdown(choices=get_ollama_models(url)),
-        inputs=[ollama_tb],
+    def refresh_lmstudio_models(url: str):
+        models = get_lmstudio_models(url)
+        return gr.Dropdown(choices=models, value=models[0] if models else None)
+
+    lmstudio_refresh_btn.click(
+        fn=refresh_lmstudio_models,
+        inputs=[lmstudio_tb],
         outputs=[model_dd_ctx],
+    ).then(
+        fn=test_lm_connection,
+        inputs=[lmstudio_tb, model_dd_ctx, capture_log],
+        outputs=[capture_log],
+    )
+
+    model_dd_ctx.change(
+        fn=load_lmstudio_model,
+        inputs=[lmstudio_tb, model_dd_ctx],
+        outputs=[ctx_status],
     )
 
     # Capture timer tick
     capture_timer.tick(
         fn=context_tick,
         inputs=[
-            lmstudio_tb, ollama_tb, model_tb,
+            lmstudio_tb, model_tb,
             alpha_sl, transition_sl,
             bridge_tb, focus_state, capture_log,
         ],

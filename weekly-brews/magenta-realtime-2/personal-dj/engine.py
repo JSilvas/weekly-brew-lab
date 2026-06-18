@@ -121,6 +121,16 @@ class DJEngine:
         focus_suffix: str,
         alpha: float,
     ) -> np.ndarray | None:
+        focus_embed = self._embed(focus_suffix) if focus_suffix else None
+
+        # ── No canvas nodes: context drives everything ─────────────────────────
+        if not prompts:
+            if focus_embed is None:
+                return None          # nothing yet — gen loop outputs silence
+            norm = np.linalg.norm(focus_embed)
+            return focus_embed / norm if norm > 1e-8 else focus_embed
+
+        # ── Canvas nodes present: weighted blend + focus bias ──────────────────
         result: np.ndarray | None = None
         w_sum = 0.0
         for prompt, w in zip(prompts, weights):
@@ -137,10 +147,8 @@ class DJEngine:
         if w_sum > 0:
             result /= w_sum
 
-        if focus_suffix and alpha > 0:
-            fe = self._embed(focus_suffix)
-            if fe is not None:
-                result = result + alpha * fe
+        if focus_embed is not None and alpha > 0:
+            result = result + alpha * focus_embed
 
         norm = np.linalg.norm(result)
         if norm > 1e-8:
@@ -215,6 +223,8 @@ class DJEngine:
             chunk      = self._ring.read(frames)
             outdata[:] = chunk * self._volume
 
+        # No device pin — let sounddevice query the OS default output on each
+        # new stream open. This picks up system audio output changes after refresh.
         self._sd_stream = sd.OutputStream(
             samplerate=SAMPLE_RATE,
             channels=CHANNELS,
