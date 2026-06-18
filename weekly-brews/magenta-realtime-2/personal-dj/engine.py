@@ -86,6 +86,7 @@ class DJEngine:
         self._sd_stream       = None
         self._ramp_thread: threading.Thread | None = None
         self._ramp_cancel     = False
+        self._midi_notes: list[int] | None = None  # None = unconditioned
 
     # ── Load (submitted to MLX thread) ───────────────────────────────────────
 
@@ -248,6 +249,17 @@ class DJEngine:
     def set_volume(self, v: float):
         self._volume = float(np.clip(v, 0.0, 1.0))
 
+    def set_notes(self, active: set[int]) -> None:
+        """Update MIDI note conditioning. Empty set = no note conditioning."""
+        if not active:
+            self._midi_notes = None
+            return
+        arr = [0] * 128
+        for n in active:
+            if 0 <= n < 128:
+                arr[n] = 1  # sustain
+        self._midi_notes = arr
+
     def _gen_loop(self):
         """Runs on the MLX thread — MUST stay on this thread for GPU streams."""
         state = None
@@ -266,7 +278,7 @@ class DJEngine:
             try:
                 wav, state = self._mrt.generate(
                     style=style,
-                    notes=None,
+                    notes=self._midi_notes,
                     frames=FRAMES_CHUNK,
                     state=state,
                 )

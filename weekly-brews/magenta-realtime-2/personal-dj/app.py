@@ -59,9 +59,11 @@ def _append_log(log: str, msg: str) -> str:
 # Solution: HTML structure goes in gr.HTML; JS runs via demo.load(fn=None, js=...).
 
 CANVAS_HTML = """
+<div id="pdj-outer" style="width:100%;">
+
 <div id="pdj-wrap" style="
   position:relative;width:100%;height:480px;
-  background:#09090f;border-radius:10px;overflow:hidden;
+  background:#09090f;border-radius:10px 10px 0 0;overflow:hidden;
   cursor:default;user-select:none;">
 
   <canvas id="pdj-canvas" style="position:absolute;inset:0;width:100%;height:100%;"></canvas>
@@ -73,16 +75,10 @@ CANVAS_HTML = """
       background:#1a1a2e;color:#eee;border:1px solid #555;border-radius:6px;
       padding:4px 8px;font-size:13px;min-width:180px;outline:none;">
 
-  <!-- weight store: canvas JS writes here; Gradio timer js= reads it -->
+  <!-- weight+notes store: JS writes here; Gradio timer js= reads it -->
   <div id="pdj-data" style="display:none;"></div>
-
-  <div id="pdj-focus-pill" style="
-    position:absolute;top:10px;right:10px;z-index:10;
-    background:rgba(255,255,255,0.07);border-radius:20px;
-    padding:4px 12px;font-size:11px;color:#aaa;max-width:260px;
-    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:none;">
-    🎯 <span id="pdj-focus-text"></span>
-  </div>
+  <!-- focus bridge: Python writes here; JS polls to update focus node label -->
+  <div id="pdj-focus-bridge" style="display:none;"></div>
 
   <div style="
     position:absolute;bottom:0;left:0;right:0;height:44px;z-index:10;
@@ -99,7 +95,26 @@ CANVAS_HTML = """
         cursor:pointer;line-height:1;display:flex;align-items:center;justify-content:center;">
       +
     </button>
+    <button id="pdj-kbd-toggle" title="Toggle MIDI keyboard"
+      style="
+        background:rgba(255,255,255,0.1);border:none;color:#eee;
+        border-radius:6px;padding:0 8px;height:28px;font-size:13px;
+        cursor:pointer;line-height:1;">
+      🎹
+    </button>
   </div>
+</div>
+
+<!-- Collapsible keyboard section -->
+<div id="pdj-keyboard-section" style="
+  display:none;width:100%;height:90px;
+  background:#06060e;border-radius:0 0 10px 10px;
+  border-top:1px solid rgba(255,255,255,0.06);
+  overflow:hidden;position:relative;">
+  <div id="pdj-keyboard" style="
+    position:absolute;inset:8px 10px;"></div>
+</div>
+
 </div>
 """
 
@@ -147,15 +162,17 @@ for (let i = SHUFFLED.length - 1; i > 0; i--) {
 }
 
 // ── Constants (matching collider) ─────────────────────────────────────────────
-const PROMPT_R   = 22;
-const LISTENER_R = 26;
-const FALLOFF    = 2.0;
-const MAX_NODES  = 6;
-const MIN_NODES  = 1;
-const MAX_SPEED  = 700;     // px/s ceiling
-const DAMPING    = 2.8;     // exponential decay rate per second
-const COLORS     = ['#ff6b6b','#48dbfb','#ffd32a','#0be881','#f8b500','#ff5e57'];
-const BRIDGE_HZ  = 10;
+const PROMPT_R    = 22;
+const LISTENER_R  = 26;
+const FALLOFF     = 2.0;
+const MAX_NODES   = 6;
+const MIN_NODES   = 1;
+const MAX_SPEED   = 700;     // px/s ceiling
+const DAMPING     = 0.35;    // exponential decay rate per second (~5s coast)
+const COLORS      = ['#ff6b6b','#48dbfb','#ffd32a','#0be881','#f8b500','#ff5e57'];
+const BRIDGE_HZ   = 10;
+const FOCUS_COLOR = '#a29bfe';  // lavender — visually distinct from prompt nodes
+const FOCUS_ID    = 'focus';
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let W = 0, H = 0, PLAY_H = 0; // PLAY_H = H minus controls bar
@@ -168,6 +185,7 @@ let selectedId  = null;
 let nextId      = 1;
 let nextColor   = 1;
 let deckIdx     = 1;
+let focusDeletedByUser = false;  // true after user explicitly trashes focus node
 let dashOffsets = [];
 let lastBridge  = 0;
 let animId      = null;
@@ -189,8 +207,10 @@ function resize() {
 }
 
 function clampBall(b, R) {
-  b.x = Math.max(R, Math.min(W - R, b.x));
-  b.y = Math.max(R, Math.min(PLAY_H - R, b.y));
+  if (b.x < R)        { b.x = R;          b.vx =  Math.abs(b.vx); }
+  if (b.x > W - R)    { b.x = W - R;      b.vx = -Math.abs(b.vx); }
+  if (b.y < R)        { b.y = R;          b.vy =  Math.abs(b.vy); }
+  if (b.y > PLAY_H-R) { b.y = PLAY_H - R; b.vy = -Math.abs(b.vy); }
 }
 
 function clampAll() {
@@ -313,7 +333,7 @@ function draw(weights) {
 
   // Prompt nodes
   nodes.forEach((n, i) => {
-    const color    = COLORS[n.colorIdx % COLORS.length];
+    const color    = n.isFocus ? FOCUS_COLOR : COLORS[n.colorIdx % COLORS.length];
     const w        = weights[i] || 0;
     const selected = n.id === selectedId;
 
@@ -325,6 +345,18 @@ function draw(weights) {
     ctx.fillStyle = color;
     ctx.fill();
     ctx.restore();
+
+    // Focus node: dashed outer ring to distinguish it
+    if (n.isFocus) {
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(n.x, n.y, PROMPT_R + 7, 0, Math.PI*2);
+      ctx.strokeStyle = `rgba(162,155,254,${0.35 + 0.5 * w})`;
+      ctx.lineWidth   = 1.5;
+      ctx.setLineDash([4, 4]);
+      ctx.stroke();
+      ctx.restore();
+    }
 
     if (selected) {
       ctx.beginPath();
@@ -398,7 +430,11 @@ function loop(ts) {
 // write to a plain <div> and let the gr.Timer js= parameter read it each tick.
 function pushBridge(weights) {
   const el = document.getElementById('pdj-data');
-  if (el) el.textContent = JSON.stringify({ weights, prompts: nodes.map(n => n.label) });
+  if (el) el.textContent = JSON.stringify({
+    weights,
+    prompts: nodes.map(n => n.label),
+    notes:   [...activeNotes],
+  });
 }
 
 // ── Hit testing ───────────────────────────────────────────────────────────────
@@ -505,9 +541,11 @@ function initWhenReady() {
 
     // Drop on trash zone — no minimum enforced, zero nodes = full context-driven mode
     if (drag.type === 'node' && overTrash(dragMX, dragMY)) {
+      const trashed = nodes.find(nd => nd.id === drag.id);
       nodes = nodes.filter(nd => nd.id !== drag.id);
       dashOffsets = nodes.map(() => 0);
       if (selectedId === drag.id) selectedId = null;
+      if (trashed?.isFocus) focusDeletedByUser = true;
       drag = null;
       return;
     }
@@ -538,11 +576,15 @@ function initWhenReady() {
     e.preventDefault();
     const [mx, my] = canvasXY(e);
     const hit = hitTest(mx, my);
-    if (hit?.type === 'node' && nodes.length > MIN_NODES) {
-      const idx = nodes.findIndex(n => n.id === hit.id);
-      nodes.splice(idx, 1);
-      dashOffsets.splice(idx, 1);
-      if (selectedId === hit.id) selectedId = null;
+    if (hit?.type === 'node') {
+      const n = nodes.find(n => n.id === hit.id);
+      if (n?.isFocus || nodes.length > MIN_NODES) {
+        const idx = nodes.findIndex(n => n.id === hit.id);
+        nodes.splice(idx, 1);
+        dashOffsets.splice(idx, 1);
+        if (selectedId === hit.id) selectedId = null;
+        if (n?.isFocus) focusDeletedByUser = true;
+      }
     }
   });
 
@@ -565,12 +607,216 @@ function initWhenReady() {
     addNode(pad + Math.random() * (W - 2*pad), pad + Math.random() * (PLAY_H - 2*pad));
   });
 
+  const kbdToggle = document.getElementById('pdj-kbd-toggle');
+  if (kbdToggle) kbdToggle.addEventListener('click', toggleKeyboard);
+
   // ── Start ─────────────────────────────────────────────────────────────────────
   resize();
   buildLayout();
   const ro = new ResizeObserver(() => resize());
   ro.observe(wrap);
   animId = requestAnimationFrame(loop);
+}
+
+// ── Focus node ────────────────────────────────────────────────────────────────
+
+function getFocusText() {
+  return (document.getElementById('pdj-focus-bridge')?.textContent || '').trim();
+}
+
+function hasFocusNode() {
+  return nodes.some(n => n.isFocus);
+}
+
+function addFocusNode() {
+  if (hasFocusNode()) return;
+  focusDeletedByUser = false;
+  const label = getFocusText() || 'Context Flavor';
+  nodes.push({
+    id: FOCUS_ID, colorIdx: -1, isFocus: true,
+    x: W / 2, y: PLAY_H / 2,
+    vx: (Math.random() - 0.5) * 80,
+    vy: (Math.random() - 0.5) * 80,
+    label,
+  });
+  dashOffsets.push(0);
+}
+
+// Expose for Gradio button + debug
+window.pdjAddFocusNode = addFocusNode;
+window.pdjKick = (speed = 0.6) => {
+  const speedEl = document.getElementById('pdj-speed');
+  if (speedEl) { speedEl.value = speed; speedEl.dispatchEvent(new Event('input')); }
+  const v = 250 + Math.random() * 150;
+  nodes.forEach(n => { n.vx = (Math.random()-0.5)*2*v; n.vy = (Math.random()-0.5)*2*v; });
+  listener.vx = (Math.random()-0.5)*2*v; listener.vy = (Math.random()-0.5)*2*v;
+};
+
+// Poll focus bridge: update focus node label when context capture produces new text,
+// and auto-add the focus node on first arrival (unless user explicitly deleted it).
+setInterval(() => {
+  const text = getFocusText();
+  if (!text) return;
+  const fn = nodes.find(n => n.isFocus);
+  if (fn) {
+    if (fn.label !== text) fn.label = text;
+  } else if (!focusDeletedByUser) {
+    addFocusNode();
+  }
+}, 1500);
+
+// ── MIDI keyboard ─────────────────────────────────────────────────────────────
+
+const KB_START   = 60;   // C4
+const KB_END     = 76;   // E5 (matches JAM app default)
+const KB_BLACK   = new Set([1,3,6,8,10]);
+const KB_GAP     = 2;    // px between white keys
+const KB_ACCENT  = '#48dbfb';
+
+// Semitone offset → QWERTY key (same mapping as JAM PianoKeyboard.tsx)
+const KB_S2K = {0:'a',1:'w',2:'s',3:'e',4:'d',5:'f',6:'t',7:'g',8:'y',9:'h',10:'u',11:'j',12:'k',13:'o',14:'l',15:'p',16:';'};
+const KB_K2S = Object.fromEntries(Object.entries(KB_S2K).map(([s,k])=>[k,+s]));
+
+let activeNotes = new Set();
+let kbBuilt     = false;
+let kbOpen      = false;
+
+function noteOn(note) {
+  if (activeNotes.has(note)) return;
+  activeNotes.add(note);
+  const el = document.querySelector(`#pdj-keyboard [data-note="${note}"]`);
+  if (el) el.dataset.active = '1';
+  renderKeyColors();
+}
+
+function noteOff(note) {
+  if (!activeNotes.has(note)) return;
+  activeNotes.delete(note);
+  const el = document.querySelector(`#pdj-keyboard [data-note="${note}"]`);
+  if (el) delete el.dataset.active;
+  renderKeyColors();
+}
+
+function renderKeyColors() {
+  document.querySelectorAll('#pdj-keyboard [data-note]').forEach(el => {
+    const isBlack = el.dataset.black === '1';
+    const isActive = el.dataset.active === '1';
+    el.style.backgroundColor = isActive ? KB_ACCENT : (isBlack ? '#111' : '#e8e8e8');
+  });
+}
+
+function buildKeyboard() {
+  if (kbBuilt) return;
+  kbBuilt = true;
+  const kbd = document.getElementById('pdj-keyboard');
+  if (!kbd) return;
+
+  // Collect white keys in order
+  const whites = [];
+  for (let n = KB_START; n <= KB_END; n++) {
+    if (!KB_BLACK.has(n % 12)) whites.push(n);
+  }
+  const wCount = whites.length;
+
+  // Style kbd as flex row for white keys
+  kbd.style.display    = 'flex';
+  kbd.style.gap        = KB_GAP + 'px';
+  kbd.style.userSelect = 'none';
+  kbd.style.touchAction= 'none';
+  kbd.style.width      = '100%';
+  kbd.style.height     = '100%';
+
+  // White keys
+  whites.forEach((note, wi) => {
+    const offset = note - KB_START;
+    const qKey   = KB_S2K[offset];
+    const div    = document.createElement('div');
+    div.dataset.note  = note;
+    div.dataset.black = '0';
+    div.style.cssText = `flex:1;height:100%;background:#e8e8e8;border-radius:0 0 5px 5px;position:relative;cursor:pointer;`;
+    // QWERTY label
+    if (qKey) {
+      const lbl = document.createElement('span');
+      lbl.textContent = qKey.toUpperCase();
+      lbl.style.cssText = `position:absolute;bottom:7px;left:50%;transform:translateX(-50%);font-size:10px;color:rgba(0,0,0,0.35);pointer-events:none;`;
+      div.appendChild(lbl);
+    }
+    kbd.appendChild(div);
+  });
+
+  // Black keys — positioned using same calc() formula as PianoKeyboard.tsx
+  const wExpr = `((100% - ${(wCount-1)*KB_GAP}px) / ${wCount})`;
+  for (let n = KB_START; n <= KB_END; n++) {
+    if (!KB_BLACK.has(n % 12)) continue;
+    const prevWi = whites.indexOf(n - 1);
+    if (prevWi < 0) continue;
+    const offset = n - KB_START;
+    const qKey   = KB_S2K[offset];
+    const leftExpr = `calc(${prevWi+1} * ${wExpr} + ${prevWi} * ${KB_GAP}px + ${KB_GAP/2}px - (${wExpr} * 0.65 / 2))`;
+    const div = document.createElement('div');
+    div.dataset.note  = n;
+    div.dataset.black = '1';
+    div.style.cssText = `position:absolute;top:0;left:${leftExpr};width:calc(${wExpr} * 0.65);height:60%;background:#111;border-radius:0 0 4px 4px;box-shadow:0 4px 8px rgba(0,0,0,0.5);z-index:2;cursor:pointer;`;
+    if (qKey) {
+      const lbl = document.createElement('span');
+      lbl.textContent = qKey.toUpperCase();
+      lbl.style.cssText = `position:absolute;bottom:6px;left:50%;transform:translateX(-50%);font-size:9px;color:rgba(255,255,255,0.45);pointer-events:none;`;
+      div.appendChild(lbl);
+    }
+    kbd.appendChild(div);
+  }
+
+  // Pointer events — glissando support
+  let heldNote = null;
+  const getNote = (x, y) => {
+    for (const el of document.elementsFromPoint(x, y)) {
+      if (el.dataset && el.dataset.note !== undefined && el.closest('#pdj-keyboard')) return +el.dataset.note;
+    }
+    return null;
+  };
+  kbd.addEventListener('pointerdown', e => {
+    e.preventDefault();
+    kbd.setPointerCapture(e.pointerId);
+    const note = getNote(e.clientX, e.clientY);
+    if (note !== null) { heldNote = note; noteOn(note); }
+  });
+  kbd.addEventListener('pointermove', e => {
+    if (heldNote === null) return;
+    const note = getNote(e.clientX, e.clientY);
+    if (note !== null && note !== heldNote) { noteOff(heldNote); heldNote = note; noteOn(note); }
+  });
+  kbd.addEventListener('pointerup',     () => { if (heldNote !== null) { noteOff(heldNote); heldNote = null; } });
+  kbd.addEventListener('pointercancel', () => { if (heldNote !== null) { noteOff(heldNote); heldNote = null; } });
+}
+
+function toggleKeyboard() {
+  kbOpen = !kbOpen;
+  const section = document.getElementById('pdj-keyboard-section');
+  const wrap    = document.getElementById('pdj-wrap');
+  if (section) section.style.display = kbOpen ? 'block' : 'none';
+  if (wrap)    wrap.style.borderRadius = kbOpen ? '10px 10px 0 0' : '10px';
+  if (kbOpen) buildKeyboard();
+  // QWERTY events only active while keyboard is open
+  if (kbOpen) {
+    window.addEventListener('keydown', onKbdDown);
+    window.addEventListener('keyup',   onKbdUp);
+  } else {
+    window.removeEventListener('keydown', onKbdDown);
+    window.removeEventListener('keyup',   onKbdUp);
+    // Release all held notes on close
+    [...activeNotes].forEach(noteOff);
+  }
+}
+
+function onKbdDown(e) {
+  if (e.repeat || e.metaKey || e.ctrlKey) return;
+  const semi = KB_K2S[e.key.toLowerCase()];
+  if (semi !== undefined) { e.preventDefault(); noteOn(KB_START + semi); }
+}
+
+function onKbdUp(e) {
+  const semi = KB_K2S[e.key.toLowerCase()];
+  if (semi !== undefined) noteOff(KB_START + semi);
 }
 
 setTimeout(initWhenReady, 200);
@@ -589,8 +835,10 @@ def handle_weights(bridge_json: str, alpha: float, transition_s: float):
         data    = json.loads(bridge_json)
         prompts = data.get("prompts", [])
         weights = data.get("weights", [])
-        # Always call set_style — empty prompts means focus-only mode
-        engine.set_style(prompts, weights, _focus_suffix, alpha, transition_s)
+        notes   = data.get("notes", [])
+        # Focus node is now a canvas node — no separate α blending needed
+        engine.set_style(prompts, weights, '', 0, transition_s)
+        engine.set_notes(set(int(n) for n in notes))
     except Exception:
         pass
     return f"buffer {engine.buffer_s:.1f}s"
@@ -606,7 +854,7 @@ def toggle_play(playing_state: bool, bridge_json: str, alpha: float, transition_
                 data    = json.loads(bridge_json)
                 prompts = data.get("prompts", [])
                 weights = data.get("weights", [])
-                engine.set_style(prompts, weights, _focus_suffix, alpha, 0)
+                engine.set_style(prompts, weights, '', 0, 0)
             except Exception:
                 pass
         engine.play()
@@ -728,7 +976,7 @@ def context_tick(
     global _focus_suffix
 
     if not _ctx_running:
-        return focus_state, log, gr.skip(), gr.skip(), gr.skip()
+        return focus_state, log, gr.skip(), gr.skip(), gr.skip(), gr.skip()
 
     log = _append_log(log, "📸 Capturing screen…")
 
@@ -740,7 +988,7 @@ def context_tick(
         client, backend = get_lm_client(lmstudio_url)
         if client is None:
             log = _append_log(log, f"⚠️  {backend}")
-            return focus_state, log, img, backend, gr.skip()
+            return focus_state, log, img, backend, gr.skip(), gr.skip()
 
         prompts = []
         if bridge_json:
@@ -749,26 +997,23 @@ def context_tick(
             except Exception:
                 pass
 
+        # Exclude focus node's own label from node_prompts so it doesn't bias itself
+        node_prompts = [p for p in prompts if p != focus_state]
+
         log       = _append_log(log, f"🤖 {backend} — generating focus prompt…")
         new_focus = evolve_focus(
-            client, model_name, prompts, focus_state, title, b64, alpha
+            client, model_name, node_prompts, focus_state, title, b64, alpha
         )
         _focus_suffix = new_focus
         log = _append_log(log, f"🎵 → \"{new_focus}\"")
 
-        if prompts and bridge_json:
-            try:
-                data    = json.loads(bridge_json)
-                weights = data.get("weights", [])
-                engine.set_style(prompts, weights, new_focus, alpha, transition_s)
-            except Exception:
-                pass
-
-        return new_focus, log, img, f"✓ {backend}", new_focus
+        # Focus node label is updated via pdj-focus-bridge; engine blends it by position
+        bridge_html = f'<span id="pdj-focus-bridge" style="display:none">{new_focus}</span>'
+        return new_focus, log, img, f"✓ {backend}", new_focus, bridge_html
 
     except Exception as e:
         log = _append_log(log, f"✗ Error: {e}")
-        return focus_state, log, gr.skip(), gr.skip(), gr.skip()
+        return focus_state, log, gr.skip(), gr.skip(), gr.skip(), gr.skip()
 
 
 def toggle_context(running: bool):
@@ -796,16 +1041,17 @@ with gr.Blocks(title="Personal DJ") as demo:
                 # Canvas column
                 with gr.Column(scale=4):
                     canvas_html = gr.HTML(CANVAS_HTML)
-                    focus_display = gr.Textbox(
-                        label="🎯 Focus flavor",
-                        interactive=False,
-                        placeholder="Context flavor will appear here once capture is running…",
-                    )
-                    # Hidden weight bridge
-                    bridge_tb = gr.Textbox(
-                        value="", visible=False, elem_id="dj_weight_bridge",
-                        label="bridge",
-                    )
+                    with gr.Row():
+                        focus_display = gr.Textbox(
+                            label="🎯 Context Flavor",
+                            interactive=False,
+                            placeholder="Contextual flavor will appear here once capture is running…",
+                            scale=4,
+                        )
+                        add_focus_btn = gr.Button("+ Add to canvas", size="sm", scale=1, min_width=120)
+                    # Hidden bridges
+                    bridge_tb    = gr.Textbox(value="", visible=False, elem_id="dj_weight_bridge", label="bridge")
+                    focus_bridge = gr.HTML(value="", visible=False, elem_id="pdj-focus-bridge-outer")
 
                 # Controls column
                 with gr.Column(scale=1, min_width=200):
@@ -819,17 +1065,14 @@ with gr.Blocks(title="Personal DJ") as demo:
                     )
                     play_btn    = gr.Button("▶ Play", variant="primary")
                     volume_sl   = gr.Slider(0, 1, value=0.7, step=0.05, label="Volume")
-                    alpha_sl    = gr.Slider(
-                        0, 1, value=0.3, step=0.05, label="Context Influence α",
-                        info="How strongly focus context biases the canvas mix",
-                    )
                     transition_sl = gr.Slider(
                         0, 60, value=20, step=1, label="Transition Duration (s)",
-                        info="Ramp time when focus suffix updates",
+                        info="Ramp time when focus node embedding updates",
                     )
                     buffer_display = gr.Textbox(
                         label="Engine", value="idle", interactive=False,
                     )
+                    alpha_sl = gr.Slider(0, 1, value=0, visible=False)  # kept for wiring only
 
         # ── Tab 2: Context Capture ────────────────────────────────────────────
         with gr.Tab("🔍 Context Capture"):
@@ -974,7 +1217,7 @@ with gr.Blocks(title="Personal DJ") as demo:
     ).then(
         fn=context_tick,
         inputs=[lmstudio_tb, model_tb, alpha_sl, transition_sl, bridge_tb, focus_state, capture_log],
-        outputs=[focus_state, capture_log, screen_img, ctx_status, focus_display],
+        outputs=[focus_state, capture_log, screen_img, ctx_status, focus_display, focus_bridge],
     )
     ctx_stop_btn.click(
         fn=_stop_ctx,
@@ -1010,7 +1253,7 @@ with gr.Blocks(title="Personal DJ") as demo:
             alpha_sl, transition_sl,
             bridge_tb, focus_state, capture_log,
         ],
-        outputs=[focus_state, capture_log, screen_img, ctx_status, focus_display],
+        outputs=[focus_state, capture_log, screen_img, ctx_status, focus_display, focus_bridge],
     )
 
     # Mirror focus_state → Tab 2 history display
@@ -1018,6 +1261,11 @@ with gr.Blocks(title="Personal DJ") as demo:
         fn=lambda f: f,
         inputs=[focus_state],
         outputs=[focus_hist],
+    )
+
+    add_focus_btn.click(
+        fn=None,
+        js="() => { window.pdjAddFocusNode && window.pdjAddFocusNode(); }",
     )
 
     # Gradio 6: inject canvas JS via head= (executes on page load; IIFE polls for canvas element)
