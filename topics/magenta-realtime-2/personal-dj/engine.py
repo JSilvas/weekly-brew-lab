@@ -87,7 +87,6 @@ class DJEngine:
         self._ramp_thread: threading.Thread | None = None
         self._ramp_cancel     = False
         self._midi_notes: list[int] | None = None  # None = unconditioned
-        self._device_monitor_t: threading.Thread | None = None
 
     # ── Load (submitted to MLX thread) ───────────────────────────────────────
 
@@ -98,28 +97,12 @@ class DJEngine:
             return f"✗ Load failed: {e}"
 
     def _do_load(self, model_size: str) -> str:
-        import gc
         from magenta_rt import paths, MagentaRT2Mlxfn
         paths.set_magenta_home(MAGENTA_HOME)
-
-        # Free the old model before allocating the new one so Metal doesn't
-        # hold two model buffers simultaneously during the swap.
-        self._loaded = False
-        if self._mrt is not None:
-            del self._mrt
-            self._mrt = None
-            self._embed_cache.clear()
-            gc.collect()
-            try:
-                import mlx.core as mx
-                mx.metal.clear_cache()
-            except Exception:
-                pass
-
         self._mrt = MagentaRT2Mlxfn(size=model_size)
         self._mrt_state = None
+        self._loaded    = True
         self._embed_cache.clear()
-        self._loaded = True
         return f"✓ {model_size} loaded"
 
     # ── Embedding (embed_style uses TFLite/CPU — safe on any thread) ─────────
@@ -241,6 +224,8 @@ class DJEngine:
             chunk      = self._ring.read(frames)
             outdata[:] = chunk * self._volume
 
+        # No device pin — let sounddevice query the OS default output on each
+        # new stream open. This picks up system audio output changes after refresh.
         self._sd_stream = sd.OutputStream(
             samplerate=SAMPLE_RATE,
             channels=CHANNELS,
@@ -249,59 +234,10 @@ class DJEngine:
             callback=_cb,
         )
         self._sd_stream.start()
-
-        self._device_monitor_t = threading.Thread(
-            target=self._device_monitor, daemon=True
-        )
-        self._device_monitor_t.start()
 
         # Submit gen loop to the MLX thread (same thread the model was loaded on)
         self._mlx.submit(self._gen_loop)
         return "▶ Playing"
-
-    def _default_output_name(self) -> str:
-        import sounddevice as sd
-        try:
-            return sd.query_devices(kind="output")["name"]
-        except Exception:
-            return ""
-
-    def _restart_stream(self):
-        import sounddevice as sd
-        if self._sd_stream:
-            try:
-                self._sd_stream.stop()
-                self._sd_stream.close()
-            except Exception:
-                pass
-            self._sd_stream = None
-        if not self._playing:
-            return
-
-        def _cb(outdata, frames, _t, _s):
-            chunk = self._ring.read(frames)
-            outdata[:] = chunk * self._volume
-
-        self._sd_stream = sd.OutputStream(
-            samplerate=SAMPLE_RATE,
-            channels=CHANNELS,
-            dtype="float32",
-            blocksize=BLOCKSIZE,
-            callback=_cb,
-        )
-        self._sd_stream.start()
-
-    def _device_monitor(self):
-        current = self._default_output_name()
-        while self._playing:
-            time.sleep(2.0)
-            if not self._playing:
-                break
-            new = self._default_output_name()
-            if new and new != current:
-                print(f"[engine] output device → {new!r}, restarting stream")
-                current = new
-                self._restart_stream()
 
     def pause(self) -> str:
         self._playing = False

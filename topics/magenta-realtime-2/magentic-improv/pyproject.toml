@@ -1,19 +1,13 @@
 [project]
-name = "personal-dj"
+name = "magentic-improv"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
     "gradio>=5.0",
     "magenta-rt[mlx]",
-    "openai>=1.0",
-    "httpx",
     "sounddevice",
-    "mss",
-    "pillow",
     "numpy",
-    "pyobjc-framework-quartz>=12.2.1",
 ]
 
-# Point at the local magenta-realtime checkout instead of PyPI
 [tool.uv.sources]
 magenta-rt = { path = "../../../../magenta-realtime", editable = true }

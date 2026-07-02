@@ -34,37 +34,11 @@ def _get_sct():
 
 # ── Screen capture ─────────────────────────────────────────────────────────
 
-def _focused_window_bounds() -> dict | None:
-    """Return mss-compatible region dict for the frontmost window using Quartz (no Accessibility needed)."""
-    try:
-        import Quartz
-        windows = Quartz.CGWindowListCopyWindowInfo(
-            Quartz.kCGWindowListOptionOnScreenOnly | Quartz.kCGWindowListExcludeDesktopElements,
-            Quartz.kCGNullWindowID,
-        )
-        for w in windows:
-            if w.get("kCGWindowLayer", 999) == 0:
-                b = w.get("kCGWindowBounds", {})
-                x, y = int(b.get("X", 0)), int(b.get("Y", 0))
-                width, height = int(b.get("Width", 0)), int(b.get("Height", 0))
-                if width > 0 and height > 0:
-                    return {"left": x, "top": y, "width": width, "height": height}
-    except Exception:
-        pass
-    return None
-
-
 def capture_screen() -> tuple[str, Image.Image]:
-    """Grab the frontmost window; falls back to primary monitor if bounds unavailable."""
+    """Grab primary monitor → base64 JPEG + PIL image."""
     sct = _get_sct()
-    bounds = _focused_window_bounds()
-    try:
-        region = bounds if bounds else (sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0])
-        raw = sct.grab(region)
-    except Exception:
-        # bounds out of range or other mss error — fall back to full screen
-        monitor = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
-        raw = sct.grab(monitor)
+    monitor = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
+    raw = sct.grab(monitor)
     img = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
     img.thumbnail((MAX_SIDE, MAX_SIDE))
     buf = io.BytesIO()
@@ -117,11 +91,9 @@ def get_lm_client(
 # LLM writes a short flavour addition that blends with the existing node prompts.
 
 SUFFIX_SYSTEM = (
-    "You are a music-context assistant. "
-    "Given a screenshot of what the user is focused on, write a short music flavor suffix "
-    "that thematically fits the subject matter — draw from the topic, domain, or content "
-    "on screen (e.g. space exploration → 'cosmic orchestral shimmer', "
-    "legal document → 'austere chamber strings', live coding → 'glitchy minimal techno'). "
+    "You are a background music DJ. "
+    "Given a screenshot of what the user is working on, write a short thematically appropriate music prompt suffix"
+    "that would soundtrack their current activity. "
     "Output only the suffix — no quotes, no explanation."
 )
 
@@ -131,8 +103,7 @@ SUFFIX_USER = (
     "Active window: {window_title}\n"
     "Context influence: {alpha:.2f} (0=subtle, 1=strong)\n\n"
     "Write a music flavor suffix ({length_hint}) "
-    "thematically inspired by the subject of the screenshot — "
-    "what is this person looking at or working on, and what music fits that world?"
+    "that complements the canvas prompts and reflects the screenshot activity."
 )
 
 # ── Full-drive mode (no canvas nodes) ─────────────────────────────────────────
@@ -140,18 +111,17 @@ SUFFIX_USER = (
 
 FULL_SYSTEM = (
     "You are a music director scoring a live scene. "
-    "Given a screenshot of what someone is focused on, write a complete music style description "
-    "thematically inspired by the subject matter on screen — "
-    "match the domain, topic, or content, not just the energy level. "
-    "Be specific: include genre, instrumentation, and thematic color. "
+    "Given a screenshot of what the user is working on, write a short thematically appropriate music prompt"
+    "that would soundtrack their current activity. "
+    "Be specific: include genre, tempo feel, instrumentation, and emotional tone. "
     "Output only the style description — no quotes, no explanation."
 )
 
 FULL_USER = (
     "Active window: {window_title}\n\n"
     "Looking at this screenshot, write a complete music style description (up to 120 chars) "
-    "thematically suited to what this person is focused on. "
-    "Draw from the subject matter itself — what world does this content evoke?"
+    "that would score what this person is focused on right now. "
+    "Consider their activity's energy, concentration level, and emotional context."
 )
 
 
@@ -186,10 +156,7 @@ def evolve_focus(
         max_tokens = 500
 
     _model = model or "local-model"
-    # Reasoning models (Gemma 4, QwQ, etc.) consume hidden thinking tokens before
-    # producing visible output. 500 tokens is exhausted entirely by reasoning,
-    # leaving nothing for the actual response. Use a larger budget.
-    _kwargs = dict(model=_model, max_tokens=max_tokens * 6, temperature=0.7)
+    _kwargs = dict(model=_model, max_tokens=max_tokens, temperature=0.7)
 
     def _call(with_image: bool) -> str:
         user_content = (

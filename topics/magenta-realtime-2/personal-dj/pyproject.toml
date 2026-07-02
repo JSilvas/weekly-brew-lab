@@ -11,7 +11,6 @@ dependencies = [
     "mss",
     "pillow",
     "numpy",
-    "pyobjc-framework-quartz>=12.2.1",
 ]
 
 # Point at the local magenta-realtime checkout instead of PyPI
