@@ -1149,9 +1149,12 @@ with gr.Blocks(title="Personal DJ") as demo:
 
         # Check what's actually loaded in LM Studio right now
         loaded_models = get_lmstudio_models(lmstudio_url)
-        if loaded_models:
-            # LM Studio is up and has a model — show what's actually there
-            ctx_model = gr.Dropdown(choices=loaded_models, value=loaded_models[0])
+        # Strip embedding-only models — they can't do chat completion
+        chat_models = [m for m in loaded_models if "embed" not in m.lower()]
+        if chat_models:
+            # Prefer DEFAULT_CTX_MODEL if present; otherwise first chat-capable model
+            preferred = DEFAULT_CTX_MODEL if DEFAULT_CTX_MODEL in chat_models else chat_models[0]
+            ctx_model = gr.Dropdown(choices=chat_models, value=preferred)
         else:
             # Not reachable or nothing loaded — ping in background, keep default
             def _ping():
@@ -1227,7 +1230,9 @@ with gr.Blocks(title="Personal DJ") as demo:
 
     def refresh_lmstudio_models(url: str):
         models = get_lmstudio_models(url)
-        return gr.Dropdown(choices=models, value=models[0] if models else None)
+        chat_models = [m for m in models if "embed" not in m.lower()]
+        preferred = DEFAULT_CTX_MODEL if DEFAULT_CTX_MODEL in chat_models else (chat_models[0] if chat_models else None)
+        return gr.Dropdown(choices=chat_models or models, value=preferred)
 
     lmstudio_refresh_btn.click(
         fn=refresh_lmstudio_models,
